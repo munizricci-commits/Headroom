@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -201,6 +202,25 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
     return command
 
 
+def runtime_ownership(manifest: DeploymentManifest) -> str:
+    """Classify the owner that must launch and supervise this runtime."""
+
+    runtime_kind = getattr(manifest, "runtime_kind", None)
+    if (
+        runtime_kind == RuntimeKind.DOCKER.value
+        or manifest.preset == InstallPreset.PERSISTENT_DOCKER.value
+    ):
+        return "docker-supervisor"
+    if (
+        sys.platform == "darwin"
+        and manifest.preset == InstallPreset.PERSISTENT_SERVICE.value
+        and manifest.runtime_kind == RuntimeKind.PYTHON.value
+        and manifest.supervisor_kind == SupervisorKind.SERVICE.value
+    ):
+        return "launchd-exec"
+    return "popen"
+
+
 def _write_pid(profile: str, pid: int) -> None:
     path = pid_path(profile)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -217,8 +237,150 @@ def _read_pid(profile: str) -> int | None:
         return None
 
 
-def _clear_pid(profile: str) -> None:
+def _read_proc_metadata(pid: int) -> tuple[list[str], dict[str, str]] | None:
+    """Read process identity without requiring the optional psutil package."""
+
+    if Path(f"/proc/{pid}/cmdline").exists():
+        try:
+            cmdline = [
+                part.decode(errors="replace")
+                for part in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+                if part
+            ]
+            environ = {
+                part.split(b"=", 1)[0].decode(errors="replace"): part.split(b"=", 1)[1].decode(
+                    errors="replace"
+                )
+                for part in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+                if b"=" in part
+            }
+            return cmdline, environ
+        except (OSError, ValueError):
+            return None
+
+    if _is_windows():
+        # WMI is part of Windows and exposes the full command line without
+        # requiring psutil. Environment blocks are not exposed reliably, so
+        # the command-line identity is checked together with the PID file.
+        try:
+            result = run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        raw = result.stdout.strip()
+        if result.returncode != 0 or not raw:
+            return None
+        try:
+            return shlex.split(raw, posix=False), {}
+        except ValueError:
+            return None
+
+    # macOS does not expose /proc by default. `ps -wwE` is the supported
+    # system interface that returns the complete command and inherited env.
+    if sys.platform != "darwin":
+        return None
+    try:
+        result = run(
+            ["ps", "-wwE", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    raw = result.stdout.strip()
+    if result.returncode != 0 or not raw:
+        return None
+    try:
+        fields = shlex.split(raw)
+    except ValueError:
+        return None
+    environ = {}
+    for field in fields:
+        if field.startswith("HEADROOM_") and "=" in field:
+            name, value = field.split("=", 1)
+            environ[name] = value
+    return fields, environ
+
+
+def _proxy_command_matches(cmdline: list[str], manifest: DeploymentManifest) -> bool:
+    """Require the real Headroom proxy argv shape and configured port."""
+    shape = any(
+        cmdline[index : index + 3] == ["-m", "headroom.cli", "proxy"]
+        or cmdline[index : index + 2] == ["headroom", "proxy"]
+        for index in range(len(cmdline))
+    )
+    if not shape:
+        return False
+    for index, value in enumerate(cmdline):
+        if value == "--port" and index + 1 < len(cmdline):
+            return cmdline[index + 1] == str(manifest.port)
+        if value.startswith("--port="):
+            return value.split("=", 1)[1] == str(manifest.port)
+    return False
+
+
+def _proxy_deployment_markers_match(cmdline: list[str], manifest: DeploymentManifest) -> bool:
+    """Match the deployment identity embedded in supervisor-launched argv."""
+    markers = {
+        "--headroom-deployment-profile": manifest.profile,
+        "--headroom-deployment-runtime": manifest.runtime_kind,
+    }
+    for name, expected in markers.items():
+        if not any(
+            cmdline[index : index + 2] == [name, str(expected)] or value == f"{name}={expected}"
+            for index, value in enumerate(cmdline)
+        ):
+            return False
+    return True
+
+
+def _process_matches_runtime(pid: int, manifest: DeploymentManifest) -> bool:
+    """Verify the PID's deployment identity before lifecycle operations."""
+    return _process_identity(pid, manifest) is True
+
+
+def _process_identity(pid: int, manifest: DeploymentManifest) -> bool | None:
+    """Return whether a PID matches, or ``None`` when identity is unavailable."""
+    if pid == os.getpid():
+        return False
+    try:
+        import psutil  # type: ignore[import-untyped]  # optional dependency
+
+        process = psutil.Process(pid)
+        cmdline = process.cmdline()
+        environ = process.environ()
+    except Exception:
+        metadata = _read_proc_metadata(pid)
+        if metadata is None:
+            return None
+        cmdline, environ = metadata
+    if not _proxy_command_matches(cmdline, manifest):
+        return False
+    if _is_windows() and not environ:
+        if not _proxy_deployment_markers_match(cmdline, manifest):
+            return None
+        return True
+    return bool(
+        environ.get("HEADROOM_DEPLOYMENT_PROFILE") == manifest.profile
+        and environ.get("HEADROOM_DEPLOYMENT_RUNTIME") == manifest.runtime_kind
+    )
+
+
+def _clear_pid(profile: str, *, expected_pid: int | None = None) -> None:
     path = pid_path(profile)
+    if expected_pid is not None and _read_pid(profile) != expected_pid:
+        return
     if path.exists():
         path.unlink()
 
@@ -279,12 +441,26 @@ def acquire_runtime_start_lock(profile: str) -> Iterator[bool]:
 def run_foreground(manifest: DeploymentManifest) -> int:
     """Run the raw runtime command in the foreground."""
 
+    if runtime_ownership(manifest) == "docker-supervisor":
+        raise RuntimeError(
+            "Docker deployments must be started by the Docker supervisor, not run_foreground"
+        )
     command = build_runtime_command(manifest)
     env = _runtime_env(manifest)
     log_file_path = log_path(manifest.profile)
     log_file_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(log_file_path, "a", encoding="utf-8", errors="replace") as log_file:
+        if runtime_ownership(manifest) == "launchd-exec":
+            _write_pid(manifest.profile, os.getpid())
+            try:
+                os.dup2(log_file.fileno(), 1)
+                os.dup2(log_file.fileno(), 2)
+                os.execvpe(command[0], command, env)
+            except BaseException:
+                _clear_pid(manifest.profile, expected_pid=os.getpid())
+                raise
+
         proc = subprocess.Popen(command, env=env, stdout=log_file, stderr=log_file)
         _write_pid(manifest.profile, proc.pid)
 
@@ -301,7 +477,7 @@ def run_foreground(manifest: DeploymentManifest) -> int:
         try:
             return proc.wait()
         finally:
-            _clear_pid(manifest.profile)
+            _clear_pid(manifest.profile, expected_pid=proc.pid)
 
 
 def start_detached_agent(profile: str) -> subprocess.Popen[str]:
@@ -358,7 +534,7 @@ def start_persistent_docker(manifest: DeploymentManifest) -> None:
 def stop_runtime(manifest: DeploymentManifest) -> None:
     """Stop the raw runtime for the deployment."""
 
-    if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+    if runtime_ownership(manifest) == "docker-supervisor":
         run(
             ["docker", "stop", manifest.container_name],
             capture_output=True,
@@ -374,28 +550,54 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
     pid = _read_pid(manifest.profile)
     if pid is None:
         return
+    identity = _process_identity(pid, manifest)
+    if identity is None:
+        return
+    if not identity:
+        _clear_pid(manifest.profile, expected_pid=pid)
+        return
     try:
         os.kill(pid, signal.SIGTERM)
     except (OSError, SystemError):
         # SystemError covers the Windows WinError 87 surfacing described in #1544.
         pass
-    _clear_pid(manifest.profile)
+    _clear_pid(manifest.profile, expected_pid=pid)
 
 
-def wait_ready(manifest: DeploymentManifest, timeout_seconds: int = 30) -> bool:
+def wait_ready(
+    manifest: DeploymentManifest, timeout_seconds: int = 30, *, require_identity: bool = False
+) -> bool:
     """Wait for the deployment to report ready."""
 
     for _ in range(timeout_seconds):
-        if probe_ready(manifest.health_url):
+        if probe_ready(manifest.health_url) and (
+            not require_identity or runtime_status(manifest) == "running"
+        ):
             return True
         time.sleep(1)
     return False
 
 
+def runtime_ready(manifest: DeploymentManifest) -> bool:
+    """Return ready only when health and deployment identity both match."""
+    from .health import probe_ready as current_probe_ready
+
+    if not hasattr(manifest, "runtime_kind"):
+        return bool(getattr(manifest, "health_url", None)) and current_probe_ready(
+            manifest.health_url
+        )
+    try:
+        return runtime_status(manifest) == "running" and current_probe_ready(manifest.health_url)
+    except AttributeError:
+        # Test doubles and old third-party callers may provide only the health
+        # contract; persisted DeploymentManifest instances always have identity.
+        return False
+
+
 def runtime_status(manifest: DeploymentManifest) -> str:
     """Return a short status string for the deployment runtime."""
 
-    if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+    if runtime_ownership(manifest) == "docker-supervisor":
         result = run(
             ["docker", "ps", "--format", "{{.Names}}"],
             capture_output=True,
@@ -410,7 +612,16 @@ def runtime_status(manifest: DeploymentManifest) -> str:
     # Windows-safe liveness probe: a bare os.kill(pid, 0) here raised WinError 87
     # as a SystemError against the detached agent, crashing status and taking the
     # live proxy down with it (#1544).
-    return "running" if pid_alive(pid) else "stopped"
+    if not pid_alive(pid):
+        _clear_pid(manifest.profile, expected_pid=pid)
+        return "stopped"
+    identity = _process_identity(pid, manifest)
+    if identity is None:
+        return "unknown"
+    if not identity:
+        _clear_pid(manifest.profile, expected_pid=pid)
+        return "stopped"
+    return "running"
 
 
 def detect_current_deployment() -> tuple[DeploymentManifest | None, str]:
@@ -433,7 +644,8 @@ def detect_current_deployment() -> tuple[DeploymentManifest | None, str]:
     if not profile:
         return None, "foreground"
     manifest = load_manifest(profile)
-    if preset == InstallPreset.PERSISTENT_DOCKER.value:
+    runtime = os.environ.get("HEADROOM_DEPLOYMENT_RUNTIME")
+    if preset == InstallPreset.PERSISTENT_DOCKER.value or runtime == RuntimeKind.DOCKER.value:
         return manifest, "docker"
     if manifest is None:
         return None, "foreground"

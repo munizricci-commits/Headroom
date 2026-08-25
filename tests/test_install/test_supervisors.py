@@ -161,6 +161,8 @@ def test_macos_launchd_plist_switches_between_keepalive_and_interval(
     assert service_path == tmp_path / "Library" / "LaunchAgents" / "com.headroom.default.plist"
     assert "<key>KeepAlive</key>" in service_content
     assert "<key>StartInterval</key>" not in service_content
+    assert "<key>ProgramArguments</key>" in service_content
+    assert "run-headroom.sh" in service_content
 
     task_manifest = _manifest(profile="tasky", supervisor=SupervisorKind.TASK.value)
     task_path, task_content = _macos_launchd_plist(
@@ -496,6 +498,16 @@ class _LaunchctlResult:
         self.returncode = returncode
         self.stderr = stderr
         self.stdout = stdout
+
+
+def test_linux_persistent_task_stop_does_not_call_systemctl(monkeypatch) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
+    monkeypatch.setattr(
+        "headroom.install.supervisors.subprocess.run",
+        lambda *args, **kwargs: pytest.fail("cron task stop must not call systemctl"),
+    )
+
+    stop_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))
 
 
 def test_start_and_stop_supervisor_darwin_windows_and_none(monkeypatch) -> None:
