@@ -168,7 +168,7 @@ anyllm = [
 # LangChain integration
 langchain = [
     "langchain-core>=1.3.3,<4.0",
-    "langchain-openai>=1.1.14,<2.0",
+    "langchain-openai>=1.7.4,<2.0",
 ]
 # Agno agent framework integration
 agno = [
